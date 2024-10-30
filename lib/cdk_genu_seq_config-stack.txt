@@ -1,0 +1,450 @@
+import * as cdk from 'aws-cdk-lib';
+import { Stack, StackProps, Duration } from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+//import { Bucket, BlockPublicAccess, BucketEncryption, BucketPolicy } from 'aws-cdk-lib/aws-s3';
+import { Role, ServicePrincipal, ManagedPolicy } from 'aws-cdk-lib/aws-iam';
+import { CfnConfigurationRecorder, CfnDeliveryChannel } from 'aws-cdk-lib/aws-config';
+import { Key } from 'aws-cdk-lib/aws-kms';
+import { PolicyStatement } from 'aws-cdk-lib/aws-iam';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as guardduty from 'aws-cdk-lib/aws-guardduty';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as subs from 'aws-cdk-lib/aws-sns-subscriptions';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as target from 'aws-cdk-lib/aws-events-targets';
+import { Action } from 'aws-cdk-lib/aws-appconfig';
+import * as cloudtrail from 'aws-cdk-lib/aws-cloudtrail';
+
+
+ 
+
+
+export class CdkGenUSeqStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, {
+      ...props,
+      env: {
+        region: 'ap-northeast-1', // リージョンを指定
+      },
+    });
+
+    const sourceAccountId = '008971664625'; // ソースアカウントIDを指定
+
+
+    // KMSキーの作成
+    const kmsKey = new Key(this, 'ConfigS3KmsKey', {
+      enableKeyRotation: true, // KMSキーの自動ローテーションを有効化
+      policy: new cdk.aws_iam.PolicyDocument({
+        statements: [
+          new cdk.aws_iam.PolicyStatement({
+            sid: 'Enable IAM User Permissions',
+            effect: cdk.aws_iam.Effect.ALLOW,
+            principals: [
+              new cdk.aws_iam.ArnPrincipal(`arn:aws:iam::${sourceAccountId}:root`),
+              new cdk.aws_iam.ArnPrincipal(`arn:aws:sts::${sourceAccountId}:assumed-role/AWSReservedSSO_AWSAdministratorAccessDTS_a34d5ea1c76eea2a/sa-ise@dts.co.jp`),
+            ],
+            actions: ['kms:*'],
+            resources: ['*'],
+          }),
+          new cdk.aws_iam.PolicyStatement({
+            sid: 'Allow CloudTrail to encrypt logs',
+            effect: cdk.aws_iam.Effect.ALLOW,
+            principals: [new cdk.aws_iam.ServicePrincipal('cloudtrail.amazonaws.com')],
+            actions: ['kms:GenerateDataKey*'],
+            resources: ['*'],
+            conditions: {
+              StringEquals: {
+                'aws:SourceArn': `arn:aws:cloudtrail:ap-northeast-1:${sourceAccountId}:trail/GenUTrail`,
+              },
+              StringLike: {
+                'kms:EncryptionContext:aws:cloudtrail:arn': `arn:aws:cloudtrail:*:${sourceAccountId}:trail/*`,
+              },
+            },
+          }),
+          new cdk.aws_iam.PolicyStatement({
+            sid: 'Allow CloudTrail to describe key',
+            effect: cdk.aws_iam.Effect.ALLOW,
+            principals: [new cdk.aws_iam.ServicePrincipal('cloudtrail.amazonaws.com')],
+            actions: ['kms:DescribeKey'],
+            resources: ['*'],
+          }),
+          new cdk.aws_iam.PolicyStatement({
+            sid: 'Allow principals in the account to decrypt log files',
+            effect: cdk.aws_iam.Effect.ALLOW,
+            principals: [new cdk.aws_iam.AccountRootPrincipal()],
+            actions: ['kms:Decrypt', 'kms:ReEncryptFrom'],
+            resources: ['*'],
+            conditions: {
+              StringEquals: {
+                'kms:CallerAccount': `${sourceAccountId}`,
+              },
+              StringLike: {
+                'kms:EncryptionContext:aws:cloudtrail:arn': `arn:aws:cloudtrail:*:${sourceAccountId}:trail/*`,
+              },
+            },
+          }),
+          new cdk.aws_iam.PolicyStatement({
+            sid: 'Allow alias creation during setup',
+            effect: cdk.aws_iam.Effect.ALLOW,
+            principals: [new cdk.aws_iam.AccountRootPrincipal()],
+            actions: ['kms:CreateAlias'],
+            resources: ['*'],
+            conditions: {
+              StringEquals: {
+                'kms:CallerAccount': `${sourceAccountId}`,
+                'kms:ViaService': 'ec2.ap-northeast-1.amazonaws.com',
+              },
+            },
+          }),
+          new cdk.aws_iam.PolicyStatement({
+            sid: 'Enable cross account log decryption',
+            effect: cdk.aws_iam.Effect.ALLOW,
+            principals: [new cdk.aws_iam.AccountRootPrincipal()],
+            actions: ['kms:Decrypt', 'kms:ReEncryptFrom'],
+            resources: ['*'],
+            conditions: {
+              StringEquals: {
+                'kms:CallerAccount': `${sourceAccountId}`,
+              },
+              StringLike: {
+                'kms:EncryptionContext:aws:cloudtrail:arn': `arn:aws:cloudtrail:*:${sourceAccountId}:trail/*`,
+              },
+            },
+          }),
+          new cdk.aws_iam.PolicyStatement({
+            sid: 'Allow GuardDuty to encrypt findings',
+            effect: cdk.aws_iam.Effect.ALLOW,
+            principals: [new cdk.aws_iam.ServicePrincipal('guardduty.amazonaws.com')],
+            actions: ['kms:GenerateDataKey'],
+            resources: ['*'],
+            conditions: {
+              StringEquals: {
+                'aws:SourceAccount': `${sourceAccountId}`,
+                'aws:SourceArn': 'arn:aws:guardduty:ap-northeast-1:008971664625:detector/36c885d02ba23198a7e1d516ca9d0286',
+              },
+            },
+          }),
+        ],
+      }),
+    });
+
+    // S3バケットの作成
+    const configBucket = new s3.Bucket(this, 'ConfigS3Bucket', {
+      bucketName: 'ac-config-s3-008971664628-2',
+      encryption: s3.BucketEncryption.KMS, // カスタムKMSキーを使用
+      encryptionKey: kmsKey, // 作成したKMSキーを指定
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, // パブリックアクセスを完全に制限
+      versioned: false, // バージョニングを無効にする
+      lifecycleRules: [
+        {
+          id: 'ac-config-lifecycle',
+          enabled: true,
+          expiration: Duration.days(365), // 365日後にオブジェクトを削除
+        },
+      ],
+    });
+
+    const GuardDutyBucket = new s3.Bucket(this, 'GuardDutyS3Bucket', {
+      bucketName: 'ac-guardduty-s3-008971664628-2',
+      encryption: s3.BucketEncryption.KMS, // カスタムKMSキーを使用
+      encryptionKey: kmsKey, // 作成したKMSキーを指定
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, // パブリックアクセスを完全に制限
+      versioned: false, // バージョニングを無効にする
+      lifecycleRules: [
+        {
+          id: 'ac-guardduty-lifecycle',
+          enabled: true,
+          expiration: Duration.days(365), // 365日後にオブジェクトを削除
+        },
+      ],
+    });
+
+    const TrailBucket = new s3.Bucket(this, 'TrailS3Bucket', {
+      bucketName: 'ac-cloudtrail-s3-008971664628-2',
+      encryption: s3.BucketEncryption.KMS, // カスタムKMSキーを使用
+      encryptionKey: kmsKey, // 作成したKMSキーを指定
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, // パブリックアクセスを完全に制限
+      versioned: false, // バージョニングを無効にする
+      lifecycleRules: [
+        {
+          id: 'ac-trail-lifecycle',
+          enabled: true,
+          expiration: Duration.days(365), // 365日後にオブジェクトを削除
+        },
+      ],
+    });
+    //GuardDuty有効化
+    const guardDuty = new guardduty.CfnDetector(this, 'GuardDutyDetector', {
+      enable: true,
+    });
+
+    const cloudTrail = new cloudtrail.Trail(this, 'CloudTrail', {
+      bucket:TrailBucket ,
+      encryptionKey: kmsKey,
+      trailName:'GenUTrail',
+
+    }
+    );
+    
+
+
+    // S3バケットにタグを付ける
+    cdk.Tags.of(configBucket).add('Customer', '顧客名');
+    cdk.Tags.of(configBucket).add('Name', 'ac-config-s3-008971664628-2');
+    cdk.Tags.of(GuardDutyBucket).add('Customer', '顧客名');
+    cdk.Tags.of(GuardDutyBucket).add('Name', 'ac-guardduty-s3-008971664628-2');
+  
+
+    // バケットポリシーを追加してConfigからのアクセスを許可する
+    const configBucketPolicy = new s3.BucketPolicy(this, 'ConfigS3BucketPolicy', {
+      bucket: configBucket,
+    });
+
+    
+    // Configバケットポリシーの定義
+    configBucketPolicy.document.addStatements(
+      new PolicyStatement({
+        sid: 'AWSConfigBucketPermissionsCheck', // バケットアクセス権限のチェック
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal('config.amazonaws.com')], // AWS Configサービスを許可
+        actions: ['s3:GetBucketAcl'],
+        resources: [`${configBucket.bucketArn}`],
+        conditions: {
+          StringEquals: {
+            'AWS:SourceAccount': sourceAccountId, // ソースアカウントIDを指定
+          },
+        },
+      }),
+      new PolicyStatement({
+        sid: 'AWSConfigBucketExistenceCheck', // バケットの存在チェック
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal('config.amazonaws.com')],
+        actions: ['s3:ListBucket'],
+        resources: [`${configBucket.bucketArn}`],
+        conditions: {
+          StringEquals: {
+            'AWS:SourceAccount': sourceAccountId,
+          },
+        },
+      }),
+      new PolicyStatement({
+        sid: 'AWSConfigBucketDelivery', // Configデータの配信
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal('config.amazonaws.com')],
+        actions: ['s3:PutObject'],
+        resources: [`${configBucket.bucketArn}/AWSLogs/${sourceAccountId}/Config/*`],
+        conditions: {
+          StringEquals: {
+            's3:x-amz-acl': 'bucket-owner-full-control', // バケット所有者に完全なアクセス権を付与
+            'AWS:SourceAccount': sourceAccountId,
+          },
+        },
+      })
+    );
+
+    //GurdDutyバケットポリシー追加
+    const guarddutyBucketPolicy = new s3.BucketPolicy(this, 'GuardDutyS3BucketPolicy', {
+      bucket: GuardDutyBucket,
+    });
+
+    // GurdDutyバケットポリシーの定義
+    guarddutyBucketPolicy.document.addStatements(
+      new PolicyStatement({
+        sid: 'DenyNonHTTPSAccess',
+        effect: iam.Effect.DENY,
+        principals: [new iam.ServicePrincipal('guardduty.amazonaws.com')],
+        actions: ['s3:*'],
+        resources: [`${GuardDutyBucket.bucketArn}/*`],
+        conditions: {
+          Bool: { 'aws:SecureTransport': 'false' },
+          },
+        }),
+      new PolicyStatement({
+        sid: 'DenyIncorrectEncryptionHeader',
+        effect: iam.Effect.DENY,
+        principals: [new iam.ServicePrincipal('guardduty.amazonaws.com')],
+        actions: ['s3:PutObject'],
+        resources: [`${GuardDutyBucket.bucketArn}/*`],
+        conditions: {
+          StringNotEquals: {
+            's3:x-amz-server-side-encryption-aws-kms-key-id': kmsKey.keyArn,
+          },
+        },
+      }),
+      new PolicyStatement({
+        sid: 'DenyUnencryptedObjectUploads',
+        effect: iam.Effect.DENY,
+        principals: [new iam.ServicePrincipal('guardduty.amazonaws.com')],
+        actions: ['s3:PutObject'],
+        resources: [`${GuardDutyBucket.bucketArn}/*`],
+        conditions: {
+          StringNotEquals: {
+            's3:x-amz-server-side-encryption': 'aws:kms',
+          },
+        },
+      }),
+    
+
+      new PolicyStatement({
+        sid: 'AllowPutObject',
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal('guardduty.amazonaws.com')],
+        actions: ['s3:PutObject'],
+        resources: [`${GuardDutyBucket.bucketArn}/*`],
+        conditions: {
+          StringEquals: {
+            'aws:SourceAccount': sourceAccountId,
+            'aws:SourceArn': 'arn:aws:guardduty:ap-northeast-1:537124955427:detector/38c8efb9518e44ada7dce8cff2d8f2ca',
+          },
+       },
+      }),
+      new PolicyStatement({
+        sid: 'AllowGetBucketLocation',
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal('guardduty.amazonaws.com')],
+        actions: ['s3:GetBucketLocation'],
+        resources: [GuardDutyBucket.bucketArn],
+       },
+      
+
+
+    ));
+
+
+
+
+
+    TrailBucket.addToResourcePolicy(
+      new cdk.aws_iam.PolicyStatement({
+        sid: 'AWSCloudTrailAclCheck20150319-611df788-d3dc-4af2-b28f-eba37b216a52',
+        effect: cdk.aws_iam.Effect.ALLOW,
+        principals: [new cdk.aws_iam.ServicePrincipal('cloudtrail.amazonaws.com')],
+        actions: ['s3:GetBucketAcl'],
+        resources: [`${TrailBucket.bucketArn}`],
+        conditions: {
+          StringEquals: {
+            'AWS:SourceArn': `arn:aws:cloudtrail:ap-northeast-1:${sourceAccountId}:trail/GenUTrail`,
+          },
+        },
+      })
+    );
+    TrailBucket.addToResourcePolicy(
+      new cdk.aws_iam.PolicyStatement({
+        sid: 'AWSCloudTrailWrite20150319-6d0c3db9-47f8-49b7-996c-5fcbf2dc37a3',
+        effect: cdk.aws_iam.Effect.ALLOW,
+        principals: [new cdk.aws_iam.ServicePrincipal('cloudtrail.amazonaws.com')],
+        actions: ['s3:PutObject'],
+        resources: [`${TrailBucket.bucketArn}/AWSLogs/${sourceAccountId}/*`],
+        conditions: {
+          StringEquals: {
+            'AWS:SourceArn': `arn:aws:cloudtrail:ap-northeast-1:${sourceAccountId}:trail/GenUTrail`,
+            's3:x-amz-acl': 'bucket-owner-full-control',
+          },
+        },
+      })
+      );
+
+    // Output the S3 Bucket ARN
+    new cdk.CfnOutput(this, 'S3BucketArn', {
+      value: TrailBucket.bucketArn,
+      description: 'The ARN of the S3 Bucket',
+    });
+   
+
+    
+
+    // GuardDutyの有効化
+    
+    //const guardDutyDetectorArn = guardDuty.attrArn;
+
+    //const cFNS3LogsConfigurationProperty: guardduty.CfnDetector.CFNS3LogsConfigurationProperty = {
+    //  enable: true,
+    //};
+    
+    //const s3BucketProperty: guardduty.CfnMalwareProtectionPlan.S3BucketProperty = {
+    //  bucketName: 'GuardDutyBucket',
+    //  objectPrefixes: [''],
+    //};
+
+    // Config サービス用 IAM ロールの作成
+    const configRole = new Role(this, 'ConfigRole', {
+      assumedBy: new ServicePrincipal('config.amazonaws.com'), // AWS Configサービスが引き受ける
+      managedPolicies: [
+        ManagedPolicy.fromAwsManagedPolicyName('service-role/AWS_ConfigRole'), // 管理ポリシーをアタッチ
+      ],
+    });
+
+    // Config リコーダーの作成
+    const recorder = new CfnConfigurationRecorder(this, 'ConfigRecorder', {
+      roleArn: configRole.roleArn, // 作成したIAMロールを指定
+      recordingGroup: {
+        allSupported: true, // すべてのサポートされているリソースタイプを記録
+        includeGlobalResourceTypes: false, // グローバルリソース（IAM）は除外
+      },
+    });
+
+    // Config 配信チャネルの作成
+    const deliveryChannel = new CfnDeliveryChannel(this, 'ConfigDeliveryChannel', {
+      s3BucketName: configBucket.bucketName, // 配信先のS3バケット
+      configSnapshotDeliveryProperties: {
+        deliveryFrequency: 'Six_Hours', // 配信頻度は6時間ごと
+      },
+    });
+
+
+    // 配信チャネルはリコーダーが作成されてから必要
+    //deliveryChannel.node.addDependency(recorder);
+
+    const snsTopic = new sns.Topic(this, "guardduty-notifications-snstopic",{
+      displayName: "guardduty-notifications-snstopic",
+      topicName: "guardduty-notifications-snstopic",
+    });
+
+    snsTopic.addSubscription(new subs.EmailSubscription('aws-genu-alert@dts.co.jp'));
+
+    const eventBridgeRule1 = new events.Rule(this, 'guardduty-notifications-eventrule', {
+      eventPattern: {
+        source: ['aws.guardduty'],
+        detailType: ['GuardDuty Finding'],
+        detail: {
+          severity: [
+            { numeric: ['>=', 7] }
+          ]
+        }
+      },
+      ruleName: 'guardduty-notifications-eventrule'
+    });
+
+    const eventBridgeRule2 = new events.Rule(this, 'guardduty2-notifications-eventrule', {
+      eventPattern: {
+        source: ['aws.guardduty'],
+        detailType: ['GuardDuty Finding'],
+        detail: {
+          service: {
+            action: {
+              awsApiCallAction:{
+                api:['ConsoleLogin'],
+                serviceName:['signin.amazonaws.com']
+              }
+            }
+          }
+        }
+      },
+      ruleName: 'guardduty2-notifications-eventrule'
+    });
+    eventBridgeRule1.addTarget(new target.SnsTopic(snsTopic, {
+      message: events.RuleTargetInput.fromText(
+        `AWS ${events.EventField.fromPath('$.detail.accountId')} has a severity ${events.EventField.fromPath('$.detail.severity')} GuardDuty finding type ${events.EventField.fromPath('$.detail.type')} in the ${events.EventField.fromPath('$.region')} region.\n` +
+        `Resource_Type:${events.EventField.fromPath('$.detail.resource.resourceType')}\n` +
+        `Finding Description:${events.EventField.fromPath('$.detail.description')}\n` +
+        `For more details open the GuardDuty console at https://${events.EventField.fromPath('$.region')}.console.aws.amazon.com/guardduty/home?region=${events.EventField.fromPath('$.region')}#/findings?search=id%3D${events.EventField.fromPath('$.detail.id')}&macros=current\n`
+      )}));
+      eventBridgeRule2.addTarget(new target.SnsTopic(snsTopic, {
+        message: events.RuleTargetInput.fromText(
+          `AWS ${events.EventField.fromPath('$.detail.accountId')} has a severity ${events.EventField.fromPath('$.detail.severity')} GuardDuty finding type ${events.EventField.fromPath('$.detail.type')} in the ${events.EventField.fromPath('$.region')} region.\n` +
+          `Resource_Type:${events.EventField.fromPath('$.detail.resource.resourceType')}\n` +
+          `Finding Description:${events.EventField.fromPath('$.detail.description')}\n` +
+          `For more details open the GuardDuty console at https://${events.EventField.fromPath('$.region')}.console.aws.amazon.com/guardduty/home?region=${events.EventField.fromPath('$.region')}#/findings?search=id%3D${events.EventField.fromPath('$.detail.id')}&macros=current\n`
+        )}));
+        }}
